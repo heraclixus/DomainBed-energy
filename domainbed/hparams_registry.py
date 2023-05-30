@@ -34,6 +34,10 @@ def _hparams(algorithm, dataset, random_seed):
     # TODO: nonlinear classifiers disabled
     _hparam('nonlinear_classifier', False,
             lambda r: bool(r.choice([False, False])))
+    
+    # TODO: change this at times
+    # encoder to be standard encoder or the DiffFormer Encoder
+    _hparam('use_diffusion', True, lambda r: True)
 
     # Algorithm-specific hparam definitions. Each block of code below
     # corresponds to exactly one algorithm.

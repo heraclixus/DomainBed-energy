@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models
 
+from domainbed.lib.diffformer import DIFFormerConv
 from domainbed.lib import wide_resnet
 import copy
 
@@ -184,13 +185,25 @@ class ContextNet(nn.Module):
 def Featurizer(input_shape, hparams):
     """Auto-select an appropriate featurizer for the given input shape."""
     if len(input_shape) == 1:
-        return MLP(input_shape[0], hparams["mlp_width"], hparams)
+        if hparams["use_diffusion"]:
+            return DIFFormer(input_shape[0], hparams, encoder_name="MLP")   
+        else:
+            return MLP(input_shape[0], hparams["mlp_width"], hparams)
     elif input_shape[1:3] == (28, 28):
-        return MNIST_CNN(input_shape)
+        if hparams["use_diffusion"]:
+            return DIFFormer(input_shape, hparams, encoder_name="CNN")   
+        else:
+            return MNIST_CNN(input_shape)
     elif input_shape[1:3] == (32, 32):
-        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.)
+        if hparams["use_diffusion"]:
+            return DIFFormer(input_shape, hparams, encoder_name="WResNet")
+        else:
+            return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.)
     elif input_shape[1:3] == (224, 224):
-        return ResNet(input_shape, hparams)
+        if hparams["use_diffusion"]:
+            return DIFFormer(input_shape, hparams, encoder_name="ResNet")
+        else:
+            return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
 
@@ -226,3 +239,99 @@ class WholeFish(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+"""
+DiffFormer Encoder = Existing Encoders + Message Passing / Diffusion 
+"""
+class DIFFormer(nn.Module):
+    '''
+    DIFFormer model class
+    x: input node features [N, D]
+    edge_index: 2-dim indices of edges [2, E]
+    return y_hat predicted logits [N, C]
+    '''
+    def __init__(self, in_channels, hparams,
+                 num_layers=2, num_heads=1, kernel='simple',encoder_name="MLP", 
+                 alpha=0.5, dropout=0.5, use_bn=True, use_residual=True, 
+                 use_weight=True, use_graph=False):
+        super(DIFFormer, self).__init__()
+
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        # setup embedding space dimension for layernorm
+        if encoder_name == "CNN":
+            self.hidden_channels = 128
+        elif encoder_name == "ResNet":
+            self.hidden_channels = 2048
+        else:
+            self.hidden_channels = hparams["mlp_width"]
+
+        self.n_outputs = self.hidden_channels # encoder output dimension
+
+        self.bns.append(nn.LayerNorm(self.hidden_channels))
+        for i in range(num_layers):
+            self.convs.append(
+                DIFFormerConv(self.hidden_channels, self.hidden_channels, 
+                              num_heads=num_heads, kernel=kernel, use_graph=use_graph, use_weight=use_weight))
+            self.bns.append(nn.LayerNorm(self.hidden_channels))
+
+        # this is to use the existing encoders and mirror featurizer
+        if encoder_name == "CNN":
+            self.input_encoder = MNIST_CNN(input_shape=in_channels)
+        elif encoder_name == "WResNet": 
+            self.input_encoder = wide_resnet.Wide_ResNet(in_channels, 16, 2, 0.)
+        elif encoder_name == "ResNet":
+            self.input_encoder = ResNet(in_channels, hparams)
+        else:
+            self.input_encoder = MLP(in_channels, hparams["mlp_width"], hparams)
+
+        self.dropout = dropout
+        self.activation = F.relu
+        self.use_bn = use_bn
+        self.residual = use_residual
+        self.alpha = alpha
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+
+    def forward(self, x, edge_index=None, edge_weight=None):
+        layer_ = []
+
+        # input encoder
+        x = self.input_encoder(x)
+
+        # store as residual link
+        layer_.append(x)
+
+        for i, conv in enumerate(self.convs):
+            # graph convolution with DIFFormer layer
+            x = conv(x, x, edge_index, edge_weight)
+            if self.residual:
+                x = self.alpha * x + (1-self.alpha) * layer_[i]
+            if self.use_bn:
+                x = self.bns[i+1](x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            layer_.append(x)
+        return x
+
+    def get_attentions(self, x):
+        layer_, attentions = [], []
+        x = self.fcs[0](x)
+        if self.use_bn:
+            x = self.bns[0](x)
+        x = self.activation(x)
+        layer_.append(x)
+        for i, conv in enumerate(self.convs):
+            x, attn = conv(x, x, output_attn=True)
+            attentions.append(attn)
+            if self.residual:
+                x = self.alpha * x + (1 - self.alpha) * layer_[i]
+            if self.use_bn:
+                x = self.bns[i + 1](x)
+            layer_.append(x)
+        return torch.stack(attentions, dim=0) # [layer num, N, N]
